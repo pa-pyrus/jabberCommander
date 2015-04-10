@@ -8,14 +8,30 @@ Copyright (c) 2015 Pyrus <pyrus at coffee dash break dot at>
 See the file LICENSE for copying permission.
 """
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
+from json import loads
 from os import environ
 from pytz import timezone, utc
 from sleekxmpp import ClientXMPP
+from time import sleep
+from urllib.request import urlopen
 
 import logging
 LOG_FORMAT = "{levelname}({name}): {message}"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, style="{")
+
+HITBOX_URL = ("https://www.hitbox.tv/"
+              "api/media/live/list"
+              "?game=828&liveOnly=true&showHidden=false")
+TWITCH_URL = ("https://api.twitch.tv/"
+              "kraken/streams"
+              "?game=Planetary+Annihilation")
+
+
+def load_url(url, timeout):
+    """Utility method to load URLs using the concurrent module."""
+    return urlopen(url, timeout=timeout).read()
 
 
 class Commander(ClientXMPP):
@@ -93,6 +109,178 @@ class Commander(ClientXMPP):
                                                          ubernow_str))
 
         self.send_message(mto=room, mtype="groupchat", mbody=body, mhtml=html)
+
+    def handle_command_live(self, room, args):
+        """
+        Handle !live command.
+        Print current streams on Twitch and Hitbox.
+        """
+        self.logger.info("Loading Twitch and Hitbox streams.")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {"twitch": executor.submit(load_url, TWITCH_URL, 10),
+                       "hitbox": executor.submit(load_url, HITBOX_URL, 10)}
+
+        # we don't care for the return values here
+        wait(futures.values())
+        self.logger.info("Loaded Twitch and Hitbox streams.")
+
+        # start with twitch
+        twitch_streams = list()
+        if not futures["twitch"].exception():
+            raw = str(futures["twitch"].result(), "utf-8")
+            data = loads(raw)
+
+            streams = list()
+            for stream in data.get("streams", tuple()):
+                channel = stream.get("channel", None)
+                if not channel:
+                    continue
+                name = channel.get("display_name", "N/A")
+                desc = channel.get("status", "N/A")
+                url = channel.get("url", "N/A")
+                viewers = stream.get("viewers", 0)
+                streams.append({"name": name, "desc": desc,
+                                "url": url, "viewers": viewers})
+
+            twitch_streams = sorted(streams,
+                                    key=lambda x: x["viewers"],
+                                    reverse=True)
+            self.logger.info("Got %d Twitch streams.", len(twitch_streams))
+
+        # continue with hitbox
+        hitbox_streams = list()
+        if not futures["hitbox"].exception():
+            raw = str(futures["hitbox"].result(), "utf-8")
+            data = loads(raw)
+
+            streams = list()
+            for stream in data.get("livestream", tuple()):
+                channel = stream.get("channel", None)
+                if not channel:
+                    continue
+                name = stream.get("media_display_name", "N/A")
+                desc = stream.get("media_status", "N/A")
+                url = channel.get("channel_link", "N/A")
+                viewers = stream.get("media_views", 0)
+                streams.append({"name": name, "desc": desc,
+                                "url": url, "viewers": viewers})
+            hitbox_streams = sorted(streams,
+                                    key=lambda x: x["viewers"],
+                                    reverse=True)
+            self.logger.info("Got %d Hitbox streams.", len(hitbox_streams))
+
+        number = len(twitch_streams)
+        if not number:
+            body = ("There are no Planetary Annihilation streams "
+                    "on Twitch.tv at the moment.")
+            html = ("There are no Planetary Annihilation streams "
+                    "on <a href=\"{0}\">Twitch.tv</a> at the moment.".format(
+                        "http://www.twitch.tv/"
+                        "directory/game/Planetary%20Annihilation"))
+
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+        elif number > 5:
+            body = ("There currently are {0} PA streams on Twitch.tv. For a "
+                    "full list visit {1}. Five most viewed streams:".format(
+                        number,
+                        "http://www.twitch.tv/"
+                        "directory/game/Planetary%20Annihilation"))
+            html = ("There currently are <strong>{0}</strong> PA streams on "
+                    "<a href=\"{1}\">Twitch.tv</a>. "
+                    "Five most viewed streams:".format(
+                        number,
+                        "http://www.twitch.tv/"
+                        "directory/game/Planetary%20Annihilation"))
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+            number = 5
+        elif number > 1:
+            body = ("There currently are {0} PA streams on Twitch.tv:".format(
+                        number))
+            html = ("There currently are <strong>{0}</strong> PA streams on "
+                    "Twitch.tv:".format(number))
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+        else:
+            body = ("There currently is one PA stream on Twitch.tv:")
+            html = ("There currently is <strong>one</strong> PA stream on "
+                    "Twitch.tv:")
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+
+        sleep(1.0)
+
+        for x in range(number):
+            body = "Stream #{0}: {1} by {2} ({3})".format(
+                        x+1, desc,
+                        twitch_streams[x]["desc"].replace("\n", ""),
+                        twitch_streams[x]["name"],
+                        twitch_streams[x]["url"])
+            html = ("Stream <strong>#{0}</strong>: "
+                    "<a href=\"{3}\">{1} by <strong>{2}</strong></a>".format(
+                        x+1,
+                        twitch_streams[x]["desc"].replace("\n", ""),
+                        twitch_streams[x]["name"],
+                        twitch_streams[x]["url"]))
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+            sleep(1.0)
+
+        number = len(hitbox_streams)
+        if not number:
+            body = ("There are no Planetary Annihilation streams "
+                    "on Hitbox.tv at the moment.")
+            html = ("There are no Planetary Annihilation streams "
+                    "on <a href=\"{0}\">Hitbox.tv</a> at the moment.".format(
+                        "http://www.hitbox.tv/browse/planetary-annihilation"))
+
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+        elif number > 5:
+            body = ("There currently are {0} PA streams on Hitbox.tv. For a "
+                    "full list visit {1}. Five most viewed streams:".format(
+                        number,
+                        "http://www.hitbox.tv/browse/planetary-annihilation"))
+            html = ("There currently are <strong>{0}</strong> PA streams on "
+                    "<a href=\"{1}\">Hitbox.tv</a>. "
+                    "Five most viewed streams:".format(
+                        number,
+                        "http://www.hitbox.tv/browse/planetary-annihilation"))
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+            number = 5
+        elif number > 1:
+            body = ("There currently are {0} PA streams on Hitbox.tv:".format(
+                        number))
+            html = ("There currently are <strong>{0}</strong> PA streams on "
+                    "Hitbox.tv:".format(number))
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+        else:
+            body = ("There currently is one PA stream on hitbox.tv:")
+            html = ("There currently is <strong>one</strong> PA stream on "
+                    "Hitbox.tv:")
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+
+        sleep(1.0)
+
+        for x in range(number):
+            body = "Stream #{0}: {1} by {2} ({3})".format(
+                        x+1,
+                        hitbox_streams[x]["desc"].replace("\n", ""),
+                        hitbox_streams[x]["name"],
+                        hitbox_streams[x]["url"])
+            html = ("Stream <strong>#{0}</strong>: "
+                    "<a href=\"{3}\">{1} by <strong>{2}</strong></a>".format(
+                        x+1,
+                        hitbox_streams[x]["desc"].replace("\n", ""),
+                        hitbox_streams[x]["name"],
+                        hitbox_streams[x]["url"]))
+            self.send_message(mto=room, mtype="groupchat",
+                              mbody=body, mhtml=html)
+            sleep(1.0)
 
 if __name__ == "__main__":
     # get configuration
